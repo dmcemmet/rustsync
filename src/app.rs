@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,7 +38,7 @@ enum CopyStatus {
 enum DialogState {
     None,
     ConfirmCopy { scroll: ListState, button: ConfirmButton },
-    Copying { items: Vec<(PathBuf, CopyStatus)>, total_bytes: u64, copied_bytes: u64, current: usize },
+    Copying { items: Vec<(PathBuf, CopyStatus)>, total_bytes: u64, copied_bytes: u64, current: usize, scroll: ListState, file_bytes: u64, file_total: u64 },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -55,6 +57,7 @@ pub struct App {
     preview_cache: Option<(PathBuf, CachedPreview, CachedPreview)>,
     async_result: Arc<Mutex<Option<(PathBuf, CachedPreview, CachedPreview)>>>,
     loading_path: Option<PathBuf>,
+    copy_handle: Option<(File, File)>,
 }
 
 impl App {
@@ -73,6 +76,7 @@ impl App {
             preview_cache: None,
             async_result: Arc::new(Mutex::new(None)),
             loading_path: None,
+            copy_handle: None,
         }
     }
 
@@ -87,35 +91,75 @@ impl App {
             self.ensure_preview();
             terminal.draw(|f| self.draw(f))?;
 
-            // If copying, process next file
-            if let DialogState::Copying { items, total_bytes: _, copied_bytes, current } = &mut self.dialog {
+            // If copying, process one chunk at a time for progress
+            if let DialogState::Copying { items, total_bytes: _, copied_bytes, current, scroll, file_bytes, file_total } = &mut self.dialog {
                 if *current < items.len() {
                     // Check for cancel (ESC)
                     if event::poll(Duration::from_millis(0))? {
                         if let Event::Key(key) = event::read()? {
                             if key.code == KeyCode::Esc {
-                                // Mark remaining as cancelled
                                 for i in *current..items.len() {
                                     items[i].1 = CopyStatus::Failed("Cancelled".to_string());
                                 }
                                 *current = items.len();
+                                self.copy_handle = None;
                                 continue;
                             }
                         }
                     }
-                    let rel = items[*current].0.clone();
-                    let src = self.source.join(&rel);
-                    let dst = self.destination.join(&rel);
-                    let size = self.diffs.iter().find(|d| d.rel_path == rel).map_or(0, |d| d.size);
-                    if let Some(parent) = dst.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+
+                    // Open file if not already open
+                    if self.copy_handle.is_none() {
+                        let rel = items[*current].0.clone();
+                        let src = self.source.join(&rel);
+                        let dst = self.destination.join(&rel);
+                        let size = self.diffs.iter().find(|d| d.rel_path == rel).map_or(0, |d| d.size);
+                        *file_total = size;
+                        *file_bytes = 0;
+                        if let Some(parent) = dst.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match (File::open(&src), File::create(&dst)) {
+                            (Ok(r), Ok(w)) => { self.copy_handle = Some((r, w)); }
+                            (Err(e), _) | (_, Err(e)) => {
+                                items[*current].1 = CopyStatus::Failed(e.to_string());
+                                *current += 1;
+                                scroll.select(Some((*current).min(items.len().saturating_sub(1))));
+                                continue;
+                            }
+                        }
                     }
-                    match std::fs::copy(&src, &dst) {
-                        Ok(_) => { items[*current].1 = CopyStatus::Done; }
-                        Err(e) => { items[*current].1 = CopyStatus::Failed(e.to_string()); }
+
+                    // Copy a chunk
+                    if let Some((reader, writer)) = &mut self.copy_handle {
+                        let mut buf = [0u8; 65536];
+                        match reader.read(&mut buf) {
+                            Ok(0) => {
+                                // File done
+                                items[*current].1 = CopyStatus::Done;
+                                *current += 1;
+                                scroll.select(Some((*current).min(items.len().saturating_sub(1))));
+                                self.copy_handle = None;
+                            }
+                            Ok(n) => {
+                                if let Err(e) = writer.write_all(&buf[..n]) {
+                                    items[*current].1 = CopyStatus::Failed(e.to_string());
+                                    *current += 1;
+                                    scroll.select(Some((*current).min(items.len().saturating_sub(1))));
+                                    self.copy_handle = None;
+                                } else {
+                                    *file_bytes += n as u64;
+                                    *copied_bytes += n as u64;
+                                }
+                            }
+                            Err(e) => {
+                                items[*current].1 = CopyStatus::Failed(e.to_string());
+                                *current += 1;
+                                scroll.select(Some((*current).min(items.len().saturating_sub(1))));
+                                self.copy_handle = None;
+                            }
+                        }
                     }
-                    *copied_bytes += size;
-                    *current += 1;
                     continue;
                 }
                 // Copy done — wait for keypress to dismiss
@@ -278,7 +322,7 @@ impl App {
             .filter_map(|(p, _)| self.diffs.iter().find(|d| &d.rel_path == p))
             .map(|d| d.size)
             .sum();
-        self.dialog = DialogState::Copying { items, total_bytes, copied_bytes: 0, current: 0 };
+        self.dialog = DialogState::Copying { items, total_bytes, copied_bytes: 0, current: 0, scroll: ListState::default().with_selected(Some(0)), file_bytes: 0, file_total: 0 };
     }
 
     fn selected_diff(&self) -> Option<&FileDiff> {
@@ -462,20 +506,21 @@ impl App {
                 ]);
                 f.render_widget(Paragraph::new(buttons).block(Block::default().borders(Borders::ALL)), layout[1]);
             }
-            DialogState::Copying { items, total_bytes, copied_bytes, current } => {
+            DialogState::Copying { items, total_bytes, copied_bytes, current, scroll, file_bytes, file_total } => {
                 let area = centered_rect(70, 70, f.area());
                 f.render_widget(Clear, area);
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .constraints([Constraint::Min(3), Constraint::Length(3), Constraint::Length(3)])
                     .split(area);
 
-                let file_items: Vec<ListItem> = items.iter().map(|(p, status)| {
+                let file_items: Vec<ListItem> = items.iter().enumerate().map(|(i, (p, status))| {
                     let (icon, style) = match status {
                         CopyStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
                         CopyStatus::Done => ("✓", Style::default().fg(Color::Green)),
                         CopyStatus::Failed(_) => ("✗", Style::default().fg(Color::Red)),
                     };
+                    let icon = if i == *current && *current < items.len() { "►" } else { icon };
                     let text = match status {
                         CopyStatus::Failed(e) => format!("{icon} {} — {e}", p.display()),
                         _ => format!("{icon} {}", p.display()),
@@ -486,16 +531,32 @@ impl App {
                 let done = *current >= items.len();
                 let title = if done { " Copy complete (press any key) " } else { " Copying... (ESC to cancel) " };
                 let list = List::new(file_items)
-                    .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)));
-                f.render_widget(list, layout[0]);
+                    .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)))
+                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                f.render_stateful_widget(list, layout[0], scroll);
 
-                let ratio = if *total_bytes > 0 { *copied_bytes as f64 / *total_bytes as f64 } else { 1.0 };
-                let gauge = Gauge::default()
-                    .block(Block::default().borders(Borders::ALL))
+                // Per-file progress
+                let file_ratio = if *file_total > 0 { *file_bytes as f64 / *file_total as f64 } else { 0.0 };
+                let file_label = if *current < items.len() {
+                    format!("{} / {}", format_size(*file_bytes), format_size(*file_total))
+                } else {
+                    "Done".to_string()
+                };
+                let file_gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::ALL).title(" File "))
+                    .gauge_style(Style::default().fg(Color::Yellow))
+                    .ratio(file_ratio.min(1.0))
+                    .label(file_label);
+                f.render_widget(file_gauge, layout[1]);
+
+                // Total progress
+                let total_ratio = if *total_bytes > 0 { *copied_bytes as f64 / *total_bytes as f64 } else { 1.0 };
+                let total_gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::ALL).title(" Total "))
                     .gauge_style(Style::default().fg(Color::Green))
-                    .ratio(ratio.min(1.0))
+                    .ratio(total_ratio.min(1.0))
                     .label(format!("{} / {}", format_size(*copied_bytes), format_size(*total_bytes)));
-                f.render_widget(gauge, layout[1]);
+                f.render_widget(total_gauge, layout[2]);
             }
         }
     }
