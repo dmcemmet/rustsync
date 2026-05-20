@@ -12,5 +12,9 @@ chrono = "0.4"
 indicatif = "0.17"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+dirs = "6"
+filetime = "0.2"
 ratatui-image = { version = "10.0", default-features = false, features = ["image-defaults", "crossterm"] }
 image = "0.25"

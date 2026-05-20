@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::collections::{BTreeSet, HashMap};
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -19,7 +19,7 @@ use ratatui::{
 use ratatui_image::{Image, picker::Picker};
 
 use crate::preview;
-use crate::scanner::{DiffReason, FileDiff};
+use crate::scanner::{self, DiffReason, FileDiff};
 use crate::tree::{TreeNode, build_tree};
 
 enum CachedPreview {
@@ -32,13 +32,17 @@ enum CachedPreview {
 enum CopyStatus {
     Pending,
     Done,
+    Verified,
     Failed(String),
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum StatusFilter { All, New, Modified, OnlyInDest, Conflict }
 
 enum DialogState {
     None,
     ConfirmCopy { scroll: ListState, button: ConfirmButton },
-    Copying { items: Vec<(PathBuf, CopyStatus)>, total_bytes: u64, copied_bytes: u64, current: usize, scroll: ListState, file_bytes: u64, file_total: u64 },
+    Copying { items: Vec<(PathBuf, CopyStatus)>, total_bytes: u64, copied_bytes: u64, current: usize, scroll: ListState, file_bytes: u64, file_total: u64, start_time: Instant, done: bool },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -57,11 +61,15 @@ pub struct App {
     preview_cache: Option<(PathBuf, CachedPreview, CachedPreview)>,
     async_result: Arc<Mutex<Option<(PathBuf, CachedPreview, CachedPreview)>>>,
     loading_path: Option<PathBuf>,
-    copy_handle: Option<(File, File)>,
+    copy_handle: Option<(BufReader<File>, BufWriter<File>)>,
+    filter: StatusFilter,
+    mirror: bool,
+    manifest_path: PathBuf,
+    verify: bool,
 }
 
 impl App {
-    pub fn new(diffs: Vec<FileDiff>, source: PathBuf, destination: PathBuf) -> Self {
+    pub fn new(diffs: Vec<FileDiff>, source: PathBuf, destination: PathBuf, mirror: bool, manifest_path: PathBuf) -> Self {
         let tree = build_tree(&diffs);
         let mut state = ListState::default();
         if !tree.flatten().is_empty() {
@@ -77,6 +85,10 @@ impl App {
             async_result: Arc::new(Mutex::new(None)),
             loading_path: None,
             copy_handle: None,
+            filter: StatusFilter::All,
+            mirror,
+            manifest_path,
+            verify: true,
         }
     }
 
@@ -92,7 +104,7 @@ impl App {
             terminal.draw(|f| self.draw(f))?;
 
             // If copying, process one chunk at a time for progress
-            if let DialogState::Copying { items, total_bytes: _, copied_bytes, current, scroll, file_bytes, file_total } = &mut self.dialog {
+            if let DialogState::Copying { items, total_bytes: _, copied_bytes, current, scroll, file_bytes, file_total, start_time: _, done: _ } = &mut self.dialog {
                 if *current < items.len() {
                     // Check for cancel (ESC)
                     if event::poll(Duration::from_millis(0))? {
@@ -120,7 +132,7 @@ impl App {
                             let _ = std::fs::create_dir_all(parent);
                         }
                         match (File::open(&src), File::create(&dst)) {
-                            (Ok(r), Ok(w)) => { self.copy_handle = Some((r, w)); }
+                            (Ok(r), Ok(w)) => { self.copy_handle = Some((BufReader::with_capacity(1024 * 1024, r), BufWriter::with_capacity(1024 * 1024, w))); }
                             (Err(e), _) | (_, Err(e)) => {
                                 items[*current].1 = CopyStatus::Failed(e.to_string());
                                 *current += 1;
@@ -132,10 +144,11 @@ impl App {
 
                     // Copy a chunk
                     if let Some((reader, writer)) = &mut self.copy_handle {
-                        let mut buf = [0u8; 65536];
+                        let mut buf = vec![0u8; 1024 * 1024];
                         match reader.read(&mut buf) {
                             Ok(0) => {
-                                // File done
+                                // Flush and close
+                                let _ = writer.flush();
                                 items[*current].1 = CopyStatus::Done;
                                 *current += 1;
                                 scroll.select(Some((*current).min(items.len().saturating_sub(1))));
@@ -162,7 +175,60 @@ impl App {
                     }
                     continue;
                 }
-                // Copy done — wait for keypress to dismiss
+                // Copy done — post-process and wait for dismiss
+                // Preserve timestamps, permissions, verify, save manifest
+                if let DialogState::Copying { items, done, .. } = &mut self.dialog {
+                    if !*done {
+                        *done = true;
+                    let mut manifest: HashMap<PathBuf, SystemTime> = HashMap::new();
+                    for (rel, status) in items.iter_mut() {
+                        if !matches!(status, CopyStatus::Done) { continue; }
+                        let src = self.source.join(&*rel);
+                        let dst = self.destination.join(&*rel);
+                        // Preserve timestamps
+                        if let Ok(src_meta) = fs::metadata(&src) {
+                            if let Ok(mtime) = src_meta.modified() {
+                                let _ = filetime::set_file_mtime(&dst, filetime::FileTime::from_system_time(mtime));
+                                manifest.insert(rel.clone(), mtime);
+                            }
+                            // Preserve permissions
+                            #[cfg(unix)]
+                            {
+                                let _ = fs::set_permissions(&dst, src_meta.permissions());
+                            }
+                        }
+                        // Verify
+                        if self.verify {
+                            if scanner::hash_file(&src) == scanner::hash_file(&dst) {
+                                *status = CopyStatus::Verified;
+                            } else {
+                                *status = CopyStatus::Failed("Verification failed".to_string());
+                            }
+                        }
+                    }
+                    // Handle mirror deletes
+                    if self.mirror {
+                        for d in &self.diffs {
+                            if matches!(d.reason, DiffReason::OnlyInDest) {
+                                let dst = self.destination.join(&d.rel_path);
+                                let _ = fs::remove_file(&dst);
+                            }
+                        }
+                    }
+                    // Save manifest
+                    if !manifest.is_empty() {
+                        if let Some(dir) = self.manifest_path.parent() {
+                            let _ = fs::create_dir_all(dir);
+                        }
+                        if let Ok(data) = bincode::serialize(&manifest) {
+                            let _ = fs::write(&self.manifest_path, data);
+                        }
+                    }
+                    // Terminal bell
+                    eprint!("\x07");
+                    }
+                }
+                // Now wait for keypress to dismiss
                 if event::poll(Duration::from_millis(100))? {
                     if let Event::Key(_) = event::read()? {
                         self.dialog = DialogState::None;
@@ -200,6 +266,9 @@ impl App {
                         KeyCode::Char('a') => self.select_all(),
                         KeyCode::Char('u') => { self.selected.clear(); }
                         KeyCode::Char('c') => self.open_copy_dialog(),
+                        KeyCode::Char('S') => self.sync_all(),
+                        KeyCode::Char('f') => self.cycle_filter(),
+                        KeyCode::Char('v') => { self.verify = !self.verify; }
                         KeyCode::Char('p') => {
                             self.show_preview = !self.show_preview;
                             if !self.show_preview { self.preview_cache = None; }
@@ -322,7 +391,52 @@ impl App {
             .filter_map(|(p, _)| self.diffs.iter().find(|d| &d.rel_path == p))
             .map(|d| d.size)
             .sum();
-        self.dialog = DialogState::Copying { items, total_bytes, copied_bytes: 0, current: 0, scroll: ListState::default().with_selected(Some(0)), file_bytes: 0, file_total: 0 };
+        self.dialog = DialogState::Copying { items, total_bytes, copied_bytes: 0, current: 0, scroll: ListState::default().with_selected(Some(0)), file_bytes: 0, file_total: 0, start_time: Instant::now(), done: false };
+    }
+
+    fn sync_all(&mut self) {
+        // Select all visible files (respecting filter) and start copy
+        for d in &self.diffs {
+            if self.matches_filter(d) && !matches!(d.reason, DiffReason::OnlyInDest) {
+                self.selected.insert(d.rel_path.clone());
+            }
+        }
+        if !self.selected.is_empty() {
+            self.start_copy();
+        }
+    }
+
+    fn cycle_filter(&mut self) {
+        self.filter = match self.filter {
+            StatusFilter::All => StatusFilter::New,
+            StatusFilter::New => StatusFilter::Modified,
+            StatusFilter::Modified => StatusFilter::OnlyInDest,
+            StatusFilter::OnlyInDest => StatusFilter::Conflict,
+            StatusFilter::Conflict => StatusFilter::All,
+        };
+        self.rebuild_tree();
+    }
+
+    fn matches_filter(&self, d: &FileDiff) -> bool {
+        match self.filter {
+            StatusFilter::All => true,
+            StatusFilter::New => matches!(d.reason, DiffReason::Missing),
+            StatusFilter::Modified => matches!(d.reason, DiffReason::Newer { .. }),
+            StatusFilter::OnlyInDest => matches!(d.reason, DiffReason::OnlyInDest),
+            StatusFilter::Conflict => matches!(d.reason, DiffReason::Conflict { .. }),
+        }
+    }
+
+    fn rebuild_tree(&mut self) {
+        let filtered: Vec<FileDiff> = self.diffs.iter().filter(|d| self.matches_filter(d)).cloned().collect();
+        self.tree = build_tree(&filtered);
+        let flat = self.tree.flatten();
+        if flat.is_empty() {
+            self.state.select(None);
+        } else {
+            let idx = self.state.selected().unwrap_or(0).min(flat.len() - 1);
+            self.state.select(Some(idx));
+        }
     }
 
     fn selected_diff(&self) -> Option<&FileDiff> {
@@ -382,28 +496,33 @@ impl App {
         // File tree
         let flat = self.tree.flatten();
         let items: Vec<ListItem> = flat.iter().map(|(depth, node)| {
-            let indent = "  ".repeat(*depth);
+            let guide = "│ ".repeat(*depth);
             if node.is_dir {
                 let icon = if node.expanded { "▼ " } else { "▶ " };
                 let count = node.file_count();
                 let size = format_size(node.total_size());
                 let all_selected = self.collect_file_paths(node).iter().all(|p| self.selected.contains(p));
                 let mark = if all_selected && count > 0 { "✓" } else { " " };
-                let label = format!("{mark}{indent}{icon}{} [{}, {}]", node.name, count, size);
-                return ListItem::new(Line::from(Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))));
+                return ListItem::new(Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default()),
+                    Span::styled(guide, Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{icon}{} [{}, {}]", node.name, count, size), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                ]));
             }
             let diff = node.diff.as_ref().unwrap();
             let (icon, style) = match &diff.reason {
                 DiffReason::Missing => ("N", Style::default().fg(Color::Green)),
                 DiffReason::Newer { .. } => ("M", Style::default().fg(Color::Yellow)),
+                DiffReason::OnlyInDest => ("D", Style::default().fg(Color::Red)),
+                DiffReason::Conflict { .. } => ("C", Style::default().fg(Color::Magenta)),
             };
             let marked = self.selected.contains(&node.rel_path);
             let mark = if marked { "✓" } else { " " };
             let size = format_size(diff.size);
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{mark}"), if marked { Style::default().fg(Color::Green) } else { Style::default() }),
-                Span::styled(format!(" {icon} "), style),
-                Span::styled(format!("{indent}  "), Style::default()),
+                Span::styled(format!("{mark} "), if marked { Style::default().fg(Color::Green) } else { Style::default() }),
+                Span::styled(guide, Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{icon} "), style),
                 Span::styled(format!("{:>8} ", size), Style::default().fg(Color::DarkGray)),
                 Span::styled(node.name.clone(), style),
             ]))
@@ -445,12 +564,22 @@ impl App {
         let total_size: u64 = self.diffs.iter().map(|d| d.size).sum();
         let missing = self.diffs.iter().filter(|d| matches!(d.reason, DiffReason::Missing)).count();
         let newer = self.diffs.iter().filter(|d| matches!(d.reason, DiffReason::Newer { .. })).count();
+        let only_dest = self.diffs.iter().filter(|d| matches!(d.reason, DiffReason::OnlyInDest)).count();
+        let conflicts = self.diffs.iter().filter(|d| matches!(d.reason, DiffReason::Conflict { .. })).count();
         let sel_count = self.selected.len();
         let sel_size: u64 = self.selected.iter()
             .filter_map(|p| self.diffs.iter().find(|d| &d.rel_path == p))
             .map(|d| d.size).sum();
+        let filter_label = match self.filter {
+            StatusFilter::All => "all",
+            StatusFilter::New => "new",
+            StatusFilter::Modified => "mod",
+            StatusFilter::OnlyInDest => "dest-only",
+            StatusFilter::Conflict => "conflict",
+        };
+        let verify_label = if self.verify { "on" } else { "off" };
         let bar = Line::from(vec![
-            Span::styled(format!(" {missing} new, {newer} modified"), Style::default().fg(Color::White)),
+            Span::styled(format!(" {missing}N {newer}M {only_dest}D {conflicts}C"), Style::default().fg(Color::White)),
             Span::raw("  "),
             Span::styled(format!("Total: {}", format_size(total_size)), Style::default().fg(Color::Magenta)),
             Span::raw("  "),
@@ -459,7 +588,7 @@ impl App {
                 if sel_count > 0 { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) },
             ),
             Span::raw("  "),
-            Span::styled("[Space]Sel [a]All [u]Desel [c]Copy [Enter]Expand [p]Preview [q]Quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("[Space]Sel [a]All [c]Copy [S]SyncAll [f]Filter:{filter_label} [v]Verify:{verify_label} [p]Preview [q]Quit"), Style::default().fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(bar).style(Style::default().bg(Color::Black)), outer[2]);
 
@@ -506,7 +635,7 @@ impl App {
                 ]);
                 f.render_widget(Paragraph::new(buttons).block(Block::default().borders(Borders::ALL)), layout[1]);
             }
-            DialogState::Copying { items, total_bytes, copied_bytes, current, scroll, file_bytes, file_total } => {
+            DialogState::Copying { items, total_bytes, copied_bytes, current, scroll, file_bytes, file_total, start_time, done: _ } => {
                 let area = centered_rect(70, 70, f.area());
                 f.render_widget(Clear, area);
                 let layout = Layout::default()
@@ -518,6 +647,7 @@ impl App {
                     let (icon, style) = match status {
                         CopyStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
                         CopyStatus::Done => ("✓", Style::default().fg(Color::Green)),
+                        CopyStatus::Verified => ("✓✓", Style::default().fg(Color::Cyan)),
                         CopyStatus::Failed(_) => ("✗", Style::default().fg(Color::Red)),
                     };
                     let icon = if i == *current && *current < items.len() { "►" } else { icon };
@@ -555,7 +685,17 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Total "))
                     .gauge_style(Style::default().fg(Color::Green))
                     .ratio(total_ratio.min(1.0))
-                    .label(format!("{} / {}", format_size(*copied_bytes), format_size(*total_bytes)));
+                    .label({
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        let speed = if elapsed > 0.1 { *copied_bytes as f64 / elapsed } else { 0.0 };
+                        let eta = if speed > 0.0 {
+                            let remaining = (*total_bytes as f64 - *copied_bytes as f64) / speed;
+                            if remaining < 60.0 { format!(" ETA:{:.0}s", remaining) }
+                            else if remaining < 3600.0 { format!(" ETA:{:.0}m", remaining / 60.0) }
+                            else { format!(" ETA:{:.1}h", remaining / 3600.0) }
+                        } else { String::new() };
+                        format!("{} / {} — {}/s{}", format_size(*copied_bytes), format_size(*total_bytes), format_size(speed as u64), eta)
+                    });
                 f.render_widget(total_gauge, layout[2]);
             }
         }
@@ -637,6 +777,20 @@ impl App {
                 lines.push(Line::from(vec![
                     Span::styled("Status: ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!("Modified (source: {src_t}, dest: {dst_t})")),
+                ]));
+            }
+            DiffReason::OnlyInDest => {
+                lines.push(Line::from(vec![
+                    Span::styled("Status: ", Style::default().fg(Color::Red)),
+                    Span::raw("Only in destination (deleted from source)"),
+                ]));
+            }
+            DiffReason::Conflict { source_mod, dest_mod } => {
+                let src_t = DateTime::<Local>::from(*source_mod).format("%Y-%m-%d %H:%M:%S").to_string();
+                let dst_t = DateTime::<Local>::from(*dest_mod).format("%Y-%m-%d %H:%M:%S").to_string();
+                lines.push(Line::from(vec![
+                    Span::styled("Status: ", Style::default().fg(Color::Magenta)),
+                    Span::raw(format!("CONFLICT — both changed (src: {src_t}, dst: {dst_t})")),
                 ]));
             }
         }
