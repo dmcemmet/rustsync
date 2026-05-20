@@ -14,6 +14,10 @@ struct Cli {
 
     /// Destination directory (to compare against)
     destination: PathBuf,
+
+    /// Exclude directories matching glob patterns (repeatable)
+    #[arg(short = 'e', long = "exclude")]
+    exclude: Vec<String>,
 }
 
 fn main() -> std::io::Result<()> {
@@ -24,7 +28,7 @@ fn main() -> std::io::Result<()> {
     eprintln!("Scanning source: {}", source.display());
     eprintln!("Comparing with:  {}", destination.display());
 
-    let diffs = scanner::compare_dirs(&source, &destination);
+    let diffs = scanner::compare_dirs(&source, &destination, &cli.exclude);
 
     if diffs.is_empty() {
         eprintln!("Directories are in sync. No missing or newer files found.");

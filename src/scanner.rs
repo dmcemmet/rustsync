@@ -36,7 +36,7 @@ fn hash_file(path: &Path) -> Option<u64> {
     Some(hasher.digest())
 }
 
-pub fn compare_dirs(source: &Path, destination: &Path) -> Vec<FileDiff> {
+pub fn compare_dirs(source: &Path, destination: &Path, exclude: &[String]) -> Vec<FileDiff> {
     let style = ProgressStyle::default_bar()
         .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len}")
         .unwrap()
@@ -53,6 +53,7 @@ pub fn compare_dirs(source: &Path, destination: &Path) -> Vec<FileDiff> {
 
     let dest_files: HashMap<PathBuf, SystemTime> = WalkDir::new(destination)
         .into_iter()
+        .filter_entry(|e| !should_exclude(e.file_name().to_string_lossy().as_ref(), exclude))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .inspect(|_| bar.inc(1))
@@ -72,6 +73,7 @@ pub fn compare_dirs(source: &Path, destination: &Path) -> Vec<FileDiff> {
 
     let source_files: Vec<(PathBuf, u64, SystemTime)> = WalkDir::new(source)
         .into_iter()
+        .filter_entry(|e| !should_exclude(e.file_name().to_string_lossy().as_ref(), exclude))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .inspect(|_| bar.inc(1))
@@ -93,7 +95,12 @@ pub fn compare_dirs(source: &Path, destination: &Path) -> Vec<FileDiff> {
         bar.inc(1);
         let reason = match dest_files.get(&rel) {
             None => DiffReason::Missing,
-            Some(&dest_mod) if src_mod > dest_mod => {
+            Some(&dest_mod) => {
+                // Use 2-second tolerance for filesystem timestamp granularity
+                let diff = src_mod.duration_since(dest_mod).unwrap_or_default();
+                if diff.as_secs() < 2 {
+                    return None; // within tolerance, consider same
+                }
                 let src_path = source.join(&rel);
                 let dst_path = destination.join(&rel);
                 if hash_file(&src_path) == hash_file(&dst_path) {
@@ -101,11 +108,38 @@ pub fn compare_dirs(source: &Path, destination: &Path) -> Vec<FileDiff> {
                 }
                 DiffReason::Newer { source_mod: src_mod, dest_mod }
             }
-            _ => return None,
         };
         Some(FileDiff { rel_path: rel, size, modified: Some(src_mod), reason })
     }).collect();
 
     bar.finish_and_clear();
     diffs
+}
+
+fn should_exclude(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pat| {
+        if pat.contains('*') || pat.contains('?') {
+            glob_match(pat, name)
+        } else {
+            name == pat
+        }
+    })
+}
+
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    glob_match_recursive(&pat, &name)
+}
+
+fn glob_match_recursive(pat: &[char], name: &[char]) -> bool {
+    match (pat.first(), name.first()) {
+        (None, None) => true,
+        (Some('*'), _) => {
+            glob_match_recursive(&pat[1..], name) || (!name.is_empty() && glob_match_recursive(pat, &name[1..]))
+        }
+        (Some('?'), Some(_)) => glob_match_recursive(&pat[1..], &name[1..]),
+        (Some(a), Some(b)) if a == b => glob_match_recursive(&pat[1..], &name[1..]),
+        _ => false,
+    }
 }

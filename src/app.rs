@@ -350,8 +350,8 @@ impl App {
             }
             let diff = node.diff.as_ref().unwrap();
             let (icon, style) = match &diff.reason {
-                DiffReason::Missing => ("M", Style::default().fg(Color::Red)),
-                DiffReason::Newer { .. } => ("N", Style::default().fg(Color::Yellow)),
+                DiffReason::Missing => ("N", Style::default().fg(Color::Green)),
+                DiffReason::Newer { .. } => ("M", Style::default().fg(Color::Yellow)),
             };
             let marked = self.selected.contains(&node.rel_path);
             let mark = if marked { "✓" } else { " " };
@@ -406,7 +406,7 @@ impl App {
             .filter_map(|p| self.diffs.iter().find(|d| &d.rel_path == p))
             .map(|d| d.size).sum();
         let bar = Line::from(vec![
-            Span::styled(format!(" {missing} missing, {newer} newer"), Style::default().fg(Color::White)),
+            Span::styled(format!(" {missing} new, {newer} modified"), Style::default().fg(Color::White)),
             Span::raw("  "),
             Span::styled(format!("Total: {}", format_size(total_size)), Style::default().fg(Color::Magenta)),
             Span::raw("  "),
@@ -522,7 +522,7 @@ impl App {
             Some(CachedPreview::Unsupported) | None => {
                 let msg = if !is_source {
                     if self.selected_diff().is_some_and(|d| matches!(d.reason, DiffReason::Missing)) {
-                        "File does not exist in destination"
+                        "New file — does not exist in destination"
                     } else {
                         "No preview available"
                     }
@@ -566,8 +566,8 @@ impl App {
         match &diff.reason {
             DiffReason::Missing => {
                 lines.push(Line::from(vec![
-                    Span::styled("Status: ", Style::default().fg(Color::Red)),
-                    Span::raw("Missing in destination"),
+                    Span::styled("Status: ", Style::default().fg(Color::Green)),
+                    Span::raw("New file (not in destination)"),
                 ]));
             }
             DiffReason::Newer { source_mod, dest_mod } => {
@@ -575,7 +575,7 @@ impl App {
                 let dst_t = DateTime::<Local>::from(*dest_mod).format("%Y-%m-%d %H:%M:%S").to_string();
                 lines.push(Line::from(vec![
                     Span::styled("Status: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("Source ({src_t}) newer than dest ({dst_t})")),
+                    Span::raw(format!("Modified (source: {src_t}, dest: {dst_t})")),
                 ]));
             }
         }
