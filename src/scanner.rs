@@ -45,46 +45,73 @@ pub fn compare_dirs(source: &Path, destination: &Path, exclude: &[String]) -> Ve
         .template("{spinner:.cyan} {msg}")
         .unwrap();
 
-    // Phase 1: Scan destination
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(spinner_style.clone());
-    bar.set_message("Scanning destination...");
-    bar.enable_steady_tick(std::time::Duration::from_millis(80));
+    // Count subdirectories for progress bars
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(spinner_style.clone());
+    spinner.set_message("Counting directories...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    let src_dirs: u64 = WalkDir::new(source).min_depth(1).max_depth(1)
+        .into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_dir()).count() as u64;
+    let dst_dirs: u64 = WalkDir::new(destination).min_depth(1).max_depth(1)
+        .into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_dir()).count() as u64;
+    spinner.finish_and_clear();
 
-    let dest_files: HashMap<PathBuf, SystemTime> = WalkDir::new(destination)
-        .into_iter()
-        .filter_entry(|e| !should_exclude(e.file_name().to_string_lossy().as_ref(), exclude))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .inspect(|_| bar.inc(1))
-        .filter_map(|e| {
-            let rel = e.path().strip_prefix(destination).ok()?.to_path_buf();
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((rel, modified))
-        })
-        .collect();
-    bar.finish_and_clear();
+    // Phase 1 & 2: Scan source and destination in parallel
+    let source_owned = source.to_path_buf();
+    let dest_owned = destination.to_path_buf();
+    let exclude_src = exclude.to_vec();
+    let exclude_dst = exclude.to_vec();
 
-    // Phase 2: Scan source
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(spinner_style);
-    bar.set_message("Scanning source...");
-    bar.enable_steady_tick(std::time::Duration::from_millis(80));
+    let multi = indicatif::MultiProgress::new();
+    let bar_src = multi.add(ProgressBar::new(src_dirs.max(1)));
+    bar_src.set_style(style.clone());
+    bar_src.set_message("Scanning source");
+    let bar_dst = multi.add(ProgressBar::new(dst_dirs.max(1)));
+    bar_dst.set_style(style.clone());
+    bar_dst.set_message("Scanning dest  ");
 
-    let source_files: Vec<(PathBuf, u64, SystemTime)> = WalkDir::new(source)
-        .into_iter()
-        .filter_entry(|e| !should_exclude(e.file_name().to_string_lossy().as_ref(), exclude))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .inspect(|_| bar.inc(1))
-        .filter_map(|e| {
-            let rel = e.path().strip_prefix(source).ok()?.to_path_buf();
-            let meta = e.metadata().ok()?;
-            let modified = meta.modified().ok()?;
-            Some((rel, meta.len(), modified))
-        })
-        .collect();
-    bar.finish_and_clear();
+    let src_handle = std::thread::spawn(move || {
+        let mut files = Vec::new();
+        for entry in WalkDir::new(&source_owned)
+            .into_iter()
+            .filter_entry(|e| !should_exclude(e.file_name().to_string_lossy().as_ref(), &exclude_src))
+            .filter_map(|e| e.ok())
+        {
+            if entry.depth() == 1 && entry.file_type().is_dir() {
+                bar_src.inc(1);
+            }
+            if !entry.file_type().is_file() { continue; }
+            let Some(rel) = entry.path().strip_prefix(&source_owned).ok().map(|p| p.to_path_buf()) else { continue };
+            let Some(meta) = entry.metadata().ok() else { continue };
+            let Some(modified) = meta.modified().ok() else { continue };
+            files.push((rel, meta.len(), modified));
+        }
+        bar_src.finish_and_clear();
+        files
+    });
+
+    let dst_handle = std::thread::spawn(move || {
+        let mut files: HashMap<PathBuf, SystemTime> = HashMap::new();
+        for entry in WalkDir::new(&dest_owned)
+            .into_iter()
+            .filter_entry(|e| !should_exclude(e.file_name().to_string_lossy().as_ref(), &exclude_dst))
+            .filter_map(|e| e.ok())
+        {
+            if entry.depth() == 1 && entry.file_type().is_dir() {
+                bar_dst.inc(1);
+            }
+            if !entry.file_type().is_file() { continue; }
+            let Some(rel) = entry.path().strip_prefix(&dest_owned).ok().map(|p| p.to_path_buf()) else { continue };
+            let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else { continue };
+            files.insert(rel, modified);
+        }
+        bar_dst.finish_and_clear();
+        files
+    });
+
+    let source_files = src_handle.join().expect("source scan failed");
+    let dest_files = dst_handle.join().expect("dest scan failed");
+    drop(multi);
 
     // Phase 3: Compare (parallel hashing)
     let bar = ProgressBar::new(source_files.len() as u64);
